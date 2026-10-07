@@ -1,0 +1,288 @@
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+const WORLD = { width: 3200, height: 3200 };
+const FOOD_MAX = 1200;
+const BOT_MAX = 30;
+const TICK_RATE = 60;
+
+let foodId = 1;
+let botId = 1;
+const food = [];
+const bots = [];
+const players = {};
+
+function randomBetween(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function distance(aX, aY, bX, bY) {
+  return Math.hypot(aX - bX, aY - bY);
+}
+
+function radiusFromScore(score) {
+  return Math.max(16, Math.sqrt(score + 10) * 3.2);
+}
+
+function makeFood() {
+  return {
+    id: `food-${foodId++}`,
+    x: randomBetween(50, WORLD.width - 50),
+    y: randomBetween(50, WORLD.height - 50),
+    radius: randomBetween(5, 10),
+    value: randomBetween(8, 18),
+    color: '#5ef08d'
+  };
+}
+
+function spawnFood() {
+  while (food.length < FOOD_MAX) {
+    food.push(makeFood());
+  }
+}
+
+function makeBot(type = 'herbivore') {
+  const isPredator = type === 'predator';
+  const radius = isPredator ? randomBetween(18, 28) : randomBetween(13, 19);
+  return {
+    id: `bot-${botId++}`,
+    type,
+    x: randomBetween(60, WORLD.width - 60),
+    y: randomBetween(60, WORLD.height - 60),
+    radius,
+    speed: isPredator ? randomBetween(90, 130) : randomBetween(70, 110),
+    vx: 0,
+    vy: 0,
+    wanderAngle: randomBetween(0, Math.PI * 2),
+    targetX: randomBetween(0, WORLD.width),
+    targetY: randomBetween(0, WORLD.height),
+    score: randomBetween(30, 120),
+    name: type === 'predator' ? 'Hunter' : 'Grazer'
+  };
+}
+
+function seedBots() {
+  while (bots.length < BOT_MAX) {
+    const typeRoll = Math.random();
+    const type = typeRoll < 0.25 ? 'predator' : 'herbivore';
+    bots.push(makeBot(type));
+  }
+}
+
+function createPlayer(socketId, name) {
+  return {
+    id: socketId,
+    name: name || 'Player',
+    x: randomBetween(120, WORLD.width - 120),
+    y: randomBetween(120, WORLD.height - 120),
+    radius: 18,
+    speed: 190,
+    score: 0,
+    level: 1,
+    input: { up: false, down: false, left: false, right: false, boost: false }
+  };
+}
+
+function updatePlayer(player, dt) {
+  const input = player.input || { up: false, down: false, left: false, right: false, boost: false };
+  let moveX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  let moveY = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  const magnitude = Math.hypot(moveX, moveY) || 1;
+
+  if (moveX !== 0 || moveY !== 0) {
+    moveX /= magnitude;
+    moveY /= magnitude;
+  }
+
+  const speedFactor = input.boost ? 1.8 : 1;
+  player.x += (moveX * player.speed * speedFactor) * dt;
+  player.y += (moveY * player.speed * speedFactor) * dt;
+
+  player.x = clamp(player.x, 0, WORLD.width);
+  player.y = clamp(player.y, 0, WORLD.height);
+
+  player.radius = radiusFromScore(player.score);
+  player.level = 1 + Math.floor(player.score / 120);
+}
+
+function updateFoodCollisions() {
+  for (const [playerId, player] of Object.entries(players)) {
+    for (let i = food.length - 1; i >= 0; i--) {
+      const f = food[i];
+      const dist = distance(player.x, player.y, f.x, f.y);
+      if (dist < player.radius + f.radius + 8) {
+        player.score += f.value;
+        food.splice(i, 1);
+      }
+    }
+  }
+
+  for (const bot of bots) {
+    for (let i = food.length - 1; i >= 0; i--) {
+      const f = food[i];
+      const dist = distance(bot.x, bot.y, f.x, f.y);
+      if (dist < bot.radius + f.radius + 8) {
+        bot.score += f.value;
+        food.splice(i, 1);
+      }
+    }
+  }
+
+  while (food.length < FOOD_MAX) {
+    food.push(makeFood());
+  }
+}
+
+function findClosestTarget(source, targets) {
+  let best = null;
+  let bestDistance = Infinity;
+
+  for (const target of targets) {
+    if (!target || target.id === source.id) continue;
+    const dist = distance(source.x, source.y, target.x, target.y);
+    if (dist < bestDistance) {
+      bestDistance = dist;
+      best = target;
+    }
+  }
+
+  return best;
+}
+
+function updateBots(dt) {
+  const playerList = Object.values(players);
+
+  for (const bot of bots) {
+    bot.score = Math.max(bot.score, 20);
+    bot.radius = Math.max(12, Math.sqrt(bot.score + 20) * 2.8);
+
+    let target = null;
+    if (bot.type === 'predator') {
+      const smallerPlayers = playerList.filter(player => player.radius < bot.radius * 1.2);
+      const smallerBots = bots.filter(other => other.id !== bot.id && other.radius < bot.radius * 1.2);
+      target = findClosestTarget(bot, [...smallerPlayers, ...smallerBots]) || findClosestTarget(bot, food);
+    } else {
+      const nearbyFood = food.filter(f => distance(bot.x, bot.y, f.x, f.y) < 800);
+      const smallerPlayers = playerList.filter(player => player.radius < bot.radius * 1.1);
+      target = findClosestTarget(bot, nearbyFood.length ? nearbyFood : [...smallerPlayers]) || findClosestTarget(bot, food);
+    }
+
+    if (target) {
+      const angle = Math.atan2(target.y - bot.y, target.x - bot.x);
+      bot.vx = Math.cos(angle) * bot.speed;
+      bot.vy = Math.sin(angle) * bot.speed;
+    } else {
+      bot.wanderAngle += randomBetween(-0.5, 0.5);
+      bot.vx = Math.cos(bot.wanderAngle) * bot.speed * 0.6;
+      bot.vy = Math.sin(bot.wanderAngle) * bot.speed * 0.6;
+    }
+
+    bot.x += bot.vx * dt;
+    bot.y += bot.vy * dt;
+    bot.x = clamp(bot.x, 0, WORLD.width);
+    bot.y = clamp(bot.y, 0, WORLD.height);
+
+    for (const player of playerList) {
+      const dist = distance(bot.x, bot.y, player.x, player.y);
+      if (dist < bot.radius + player.radius) {
+        if (player.radius > bot.radius * 1.1) {
+          player.score += 30;
+          bot.x = randomBetween(50, WORLD.width - 50);
+          bot.y = randomBetween(50, WORLD.height - 50);
+          bot.radius = randomBetween(13, 20);
+          bot.score = randomBetween(20, 80);
+        } else {
+          player.score = Math.max(0, player.score - 12);
+          player.x = randomBetween(120, WORLD.width - 120);
+          player.y = randomBetween(120, WORLD.height - 120);
+        }
+      }
+    }
+  }
+}
+
+function cleanupBots() {
+  for (let i = bots.length - 1; i >= 0; i--) {
+    const bot = bots[i];
+    if (bot.score > 500) {
+      bots.splice(i, 1);
+      bots.push(makeBot(Math.random() < 0.25 ? 'predator' : 'herbivore'));
+    }
+  }
+}
+
+function updateWorld() {
+  const dt = 1 / TICK_RATE;
+  for (const player of Object.values(players)) {
+    updatePlayer(player, dt);
+  }
+
+  updateFoodCollisions();
+  updateBots(dt);
+  cleanupBots();
+
+  while (bots.length < BOT_MAX) {
+    bots.push(makeBot(Math.random() < 0.25 ? 'predator' : 'herbivore'));
+  }
+}
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+io.on('connection', (socket) => {
+  socket.on('join', ({ name } = {}) => {
+    const player = createPlayer(socket.id, name || 'Player');
+    players[socket.id] = player;
+    socket.emit('welcome', { id: socket.id, world: WORLD });
+  });
+
+  socket.on('input', (input = {}) => {
+    const player = players[socket.id];
+    if (!player) return;
+
+    player.input = {
+      up: !!input.up,
+      down: !!input.down,
+      left: !!input.left,
+      right: !!input.right,
+      boost: !!input.boost
+    };
+  });
+
+  socket.on('disconnect', () => {
+    delete players[socket.id];
+  });
+});
+
+function broadcastState() {
+  const payload = {
+    world: WORLD,
+    players: Object.values(players),
+    food,
+    bots
+  };
+
+  io.emit('state', payload);
+}
+
+seedFood();
+seedBots();
+
+setInterval(() => {
+  updateWorld();
+  broadcastState();
+}, 1000 / TICK_RATE);
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
